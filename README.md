@@ -44,14 +44,14 @@ Missing tools are skipped gracefully — the script will still run and just note
 ## Usage
 
 ```bash
-chmod +x ghostdomain.sh
-./ghostdomain.sh -d target.com
+chmod +x zaphound.sh
+./zaphound.sh -d target.com
 ```
 
 Optional custom output directory:
 
 ```bash
-./ghostdomain.sh -d target.com -o ./results/target
+./zaphound.sh -d target.com -o ./results/target
 ```
 
 By default, output goes to a timestamped folder: `./recon_target.com_YYYYMMDD_HHMMSS/`
