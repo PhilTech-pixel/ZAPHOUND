@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+#
+# subtakeover.sh — Subdomain enumeration + takeover check pipeline
+#
+# Usage:
+#   ./subtakeover.sh -d target.com [-o output_dir]
+#
+# Requires (install/update before running):
+#   subfinder, subfaster (if you have it), amass, assetfinder,
+#   findomain, waybackurls, httpx, dig, subjack, subzy, nuclei
+#
+# API keys for subfinder (GitHub, VirusTotal, Censys, CertSpotter, URLScan)
+# should already be configured in ~/.config/subfinder/provider-config.yaml
+
+set -uo pipefail
+
+# ---------- args ----------
+DOMAIN=""
+OUTDIR=""
+
+usage() {
+    echo "Usage: $0 -d <domain> [-o <output_dir>]"
+    exit 1
+}
+
+while getopts "d:o:h" opt; do
+    case "$opt" in
+        d) DOMAIN="$OPTARG" ;;
+        o) OUTDIR="$OPTARG" ;;
+        h) usage ;;
+        *) usage ;;
+    esac
+done
+
+[[ -z "$DOMAIN" ]] && usage
+OUTDIR="${OUTDIR:-./recon_${DOMAIN}_$(date +%Y%m%d_%H%M%S)}"
+mkdir -p "$OUTDIR"
+
+log() { echo -e "\n[*] $1"; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+log "Target: $DOMAIN"
+log "Output directory: $OUTDIR"
+
+# ---------- Stage 1: Enumeration ----------
+log "Stage 1: Subdomain enumeration"
+
+if have subfinder; then
+    log "Running subfinder..."
+    subfinder -d "$DOMAIN" -all -silent -o "$OUTDIR/subfinder.txt"
+else
+    echo "  [!] subfinder not found, skipping"
+    : > "$OUTDIR/subfinder.txt"
+fi
+
+if have subfaster; then
+    log "Running subfaster..."
+    subfaster -d "$DOMAIN" -o "$OUTDIR/subfaster.txt" 2>/dev/null || subfaster -d "$DOMAIN" > "$OUTDIR/subfaster.txt"
+else
+    echo "  [!] subfaster not found, skipping"
+    : > "$OUTDIR/subfaster.txt"
+fi
+
+if have amass; then
+    log "Running amass (this can take a while)..."
+    amass enum -d "$DOMAIN" -o "$OUTDIR/amass.txt"
+else
+    echo "  [!] amass not found, skipping"
+    : > "$OUTDIR/amass.txt"
+fi
+
+if have assetfinder; then
+    log "Running assetfinder..."
+    assetfinder --subs-only "$DOMAIN" | tee "$OUTDIR/assetfinder.txt" > /dev/null
+else
+    echo "  [!] assetfinder not found, skipping"
+    : > "$OUTDIR/assetfinder.txt"
+fi
+
+if have findomain; then
+    log "Running findomain..."
+    findomain -t "$DOMAIN" -u "$OUTDIR/findomain.txt" -q
+else
+    echo "  [!] findomain not found, skipping"
+    : > "$OUTDIR/findomain.txt"
+fi
+
+log "Pulling crt.sh certificate transparency data..."
+curl -s "https://crt.sh/?q=%25.${DOMAIN}&output=json" \
+    | grep -oE '"name_value":"[^"]+"' \
+    | sed 's/"name_value":"//; s/"//' \
+    | sed 's/\\n/\n/g' \
+    | sort -u > "$OUTDIR/crt_sh.txt"
+
+if have waybackurls; then
+    log "Running waybackurls..."
+    echo "$DOMAIN" | waybackurls \
+        | awk -F/ '{print $3}' \
+        | sort -u > "$OUTDIR/waybackurls.txt"
+else
+    echo "  [!] waybackurls not found, skipping"
+    : > "$OUTDIR/waybackurls.txt"
+fi
+
+# ---------- Stage 2: Merge + dedupe ----------
+log "Stage 2: Merging and de-duplicating results"
+cat "$OUTDIR"/subfinder.txt "$OUTDIR"/subfaster.txt "$OUTDIR"/amass.txt \
+    "$OUTDIR"/assetfinder.txt "$OUTDIR"/findomain.txt "$OUTDIR"/crt_sh.txt \
+    "$OUTDIR"/waybackurls.txt 2>/dev/null \
+    | grep -E "\.$DOMAIN$|^$DOMAIN$" \
+    | sort -u > "$OUTDIR/subdomains.txt"
+
+TOTAL=$(wc -l < "$OUTDIR/subdomains.txt")
+log "Total unique subdomains: $TOTAL"
+
+# ---------- Stage 3: Confirm live/resolving hosts (optional but recommended) ----------
+if have httpx; then
+    log "Stage 3: Probing for live hosts with httpx"
+    httpx -l "$OUTDIR/subdomains.txt" -silent -o "$OUTDIR/live_hosts.txt"
+    log "Live hosts: $(wc -l < "$OUTDIR/live_hosts.txt")"
+else
+    echo "  [!] httpx not found, skipping live-host probing (recommended: go install github.com/projectdiscovery/httpx/cmd/httpx@latest)"
+fi
+
+# ---------- Stage 4: CNAME resolution dump ----------
+log "Stage 4: Dumping CNAME records for all subdomains"
+: > "$OUTDIR/cnames.txt"
+while read -r sub; do
+    [[ -z "$sub" ]] && continue
+    cname=$(dig +short CNAME "$sub" 2>/dev/null)
+    if [[ -n "$cname" ]]; then
+        echo -e "$sub\t-> $cname" >> "$OUTDIR/cnames.txt"
+    fi
+done < "$OUTDIR/subdomains.txt"
+log "Subdomains with CNAME records: $(wc -l < "$OUTDIR/cnames.txt")"
+
+# ---------- Stage 5: Takeover checks ----------
+log "Stage 5: Running takeover detection tools"
+
+if have subjack; then
+    log "Running subjack..."
+    subjack -w "$OUTDIR/subdomains.txt" -t 100 -timeout 10 -ssl -v -c "$(go env GOPATH 2>/dev/null)/src/github.com/haccer/subjack/fingerprints.json" -o "$OUTDIR/subjack_results.txt" 2>/dev/null \
+        || subjack -w "$OUTDIR/subdomains.txt" -t 100 -timeout 10 -ssl -v -o "$OUTDIR/subjack_results.txt"
+else
+    echo "  [!] subjack not found, skipping (go install github.com/haccer/subjack@latest)"
+fi
+
+if have subzy; then
+    log "Running subzy..."
+    subzy run --targets "$OUTDIR/subdomains.txt" --timeout 10 --output "$OUTDIR/subzy_results.json"
+else
+    echo "  [!] subzy not found, skipping (go install github.com/PentestPad/subzy@latest)"
+fi
+
+if have nuclei; then
+    log "Running nuclei (takeover tag)..."
+    nuclei -l "$OUTDIR/subdomains.txt" -tags takeover -o "$OUTDIR/nuclei_takeover.txt"
+else
+    echo "  [!] nuclei not found, skipping"
+fi
+
+# ---------- Stage 6: Summary ----------
+log "Stage 6: Summary"
+echo "----------------------------------------"
+echo "Output directory : $OUTDIR"
+echo "Total subdomains  : $TOTAL"
+[[ -f "$OUTDIR/live_hosts.txt" ]] && echo "Live hosts        : $(wc -l < "$OUTDIR/live_hosts.txt")"
+echo "CNAME records     : $(wc -l < "$OUTDIR/cnames.txt" 2>/dev/null || echo 0)"
+echo "----------------------------------------"
+echo "Review these files for candidates:"
+echo "  - $OUTDIR/subjack_results.txt"
+echo "  - $OUTDIR/subzy_results.json"
+echo "  - $OUTDIR/nuclei_takeover.txt"
+echo "  - $OUTDIR/cnames.txt   (manually eyeball for S3/Heroku/GitHub Pages/etc CNAMEs)"
+echo ""
+echo "Remember: a tool flagging 'possible takeover' is a lead, not confirmation."
+echo "Manually verify"
+echo "ZAPHOUND© BY ZAPH0"
